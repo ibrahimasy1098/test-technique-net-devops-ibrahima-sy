@@ -1,0 +1,156 @@
+stages: [lint, build, test, verify]
+
+variables:
+  DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "1"
+  GIT_DEPTH: "0"
+
+include:
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+lint:commitlint:
+  stage: lint
+  image: node:22-alpine
+  before_script:
+    - apk add --no-cache git bash
+    - |
+      # Ensure we have as much history as possible for commit range resolution
+      git fetch --all --tags --prune --unshallow || git fetch --all --tags --prune --depth=200 || true
+    - npm init -y >/dev/null 2>&1
+    - npm i -D @commitlint/cli @commitlint/config-conventional >/dev/null 2>&1
+  script:
+    - |
+      set -euo pipefail
+      RANGE=""
+      if [ -n "${CI_MERGE_REQUEST_IID:-}" ]; then
+        # MR pipeline: lint commits between target and source branches
+        RANGE="$(git merge-base origin/${CI_MERGE_REQUEST_TARGET_BRANCH_NAME} HEAD)..HEAD"
+      elif [ -n "${CI_COMMIT_BEFORE_SHA:-}" ] && [ "${CI_COMMIT_BEFORE_SHA}" != "0000000000000000000000000000000000000000" ]; then
+        # Check if the before commit actually exists in this repository
+        if git cat-file -e "${CI_COMMIT_BEFORE_SHA}" 2>/dev/null; then
+          RANGE="${CI_COMMIT_BEFORE_SHA}..${CI_COMMIT_SHA}"
+        else
+          # Before commit doesn't exist, use first commit to HEAD
+          FIRST_COMMIT="$(git rev-list --max-parents=0 HEAD | tail -n1)"
+          RANGE="${FIRST_COMMIT}..HEAD"
+        fi
+      else
+        # Fallback: from first commit to HEAD (handles short histories)
+        FIRST_COMMIT="$(git rev-list --max-parents=0 HEAD | tail -n1)"
+        RANGE="${FIRST_COMMIT}..HEAD"
+      fi
+      FROM_COMMIT="${RANGE%..*}"
+      TO_COMMIT="${RANGE#*..}"
+      # Final validation: ensure commits exist
+      if ! git cat-file -e "$FROM_COMMIT" 2>/dev/null || ! git cat-file -e "$TO_COMMIT" 2>/dev/null; then
+        FIRST_COMMIT="$(git rev-list --max-parents=0 HEAD | tail -n1)"
+        FROM_COMMIT="$FIRST_COMMIT"
+        TO_COMMIT="HEAD"
+      fi
+      echo "Linting commit messages for range: ${FROM_COMMIT}..${TO_COMMIT}"
+      npx commitlint --extends @commitlint/config-conventional --from "$FROM_COMMIT" --to "$TO_COMMIT"
+
+build:
+  stage: build
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  script:
+    - dotnet restore
+    - dotnet build -c Release --no-restore
+
+test:
+  stage: test
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  script:
+    - dotnet test -c Release
+
+quality:coverage:
+  stage: test
+  image: mcr.microsoft.com/dotnet/sdk:8.0
+  script:
+    - dotnet test -c Release --collect:"XPlat Code Coverage" --logger trx --results-directory ./TestResults
+  coverage: '/Total\s*\|\s*(\d+(?:\.\d+)?)%/'
+  artifacts:
+    reports:
+      junit: ./TestResults/*.trx
+      coverage_report:
+        coverage_format: cobertura
+        path: ./TestResults/**/coverage.cobertura.xml
+    expire_in: 1 week
+
+container:build:
+  stage: build
+  image:
+    name: gcr.io/kaniko-project/executor:debug
+    entrypoint: [""]
+  variables:
+    DOCKER_CONFIG: /kaniko/.docker
+  script:
+    - echo "🏗️ Starting Kaniko build process..."
+    - echo "📁 Setting up Docker registry authentication..."
+    - mkdir -p /kaniko/.docker/
+    - |
+      # Try GitLab's built-in registry credentials first, fallback to custom tokens
+      if [ -n "$CI_REGISTRY_USER" ] && [ -n "$CI_REGISTRY_PASSWORD" ]; then
+        echo "🔑 Using GitLab's built-in registry credentials"
+        echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$CI_REGISTRY_USER\",\"password\":\"$CI_REGISTRY_PASSWORD\"}}}" > /kaniko/.docker/config.json
+      elif [ -n "$GITLAB_QIM_REGISTRY_TOKEN_USERNAME" ] && [ -n "$GITLAB_QIM_REGISTRY_TOKEN_PASSWORD" ]; then
+        echo "🔑 Using custom deploy token credentials"
+        echo "{\"auths\":{\"$CI_REGISTRY\":{\"username\":\"$GITLAB_QIM_REGISTRY_TOKEN_USERNAME\",\"password\":\"$GITLAB_QIM_REGISTRY_TOKEN_PASSWORD\"}}}" > /kaniko/.docker/config.json
+      else
+        echo "❌ No registry credentials available. Please configure either:"
+        echo "   - GitLab's built-in registry (CI_REGISTRY_USER/PASSWORD)"
+        echo "   - Custom deploy tokens (GITLAB_QIM_REGISTRY_TOKEN_USERNAME/PASSWORD)"
+        exit 1
+      fi
+    - echo "🔨 Building and pushing Docker image..."
+    - |
+      if [ -z "$CI_COMMIT_TAG" ]; then
+        echo "📦 Building branch image: $CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:$CI_COMMIT_SHA"
+        /kaniko/executor \
+          --context "$CI_PROJECT_DIR" \
+          --dockerfile "$CI_PROJECT_DIR/Dockerfile" \
+          --destination "$CI_REGISTRY_IMAGE/$CI_COMMIT_REF_SLUG:$CI_COMMIT_SHA" \
+          --cleanup
+      else
+        echo "📦 Building tagged image: $CI_REGISTRY_IMAGE:$CI_COMMIT_TAG"
+        /kaniko/executor \
+          --context "$CI_PROJECT_DIR" \
+          --dockerfile "$CI_PROJECT_DIR/Dockerfile" \
+          --destination "$CI_REGISTRY_IMAGE:$CI_COMMIT_TAG" \
+          --destination "$CI_REGISTRY_IMAGE:latest" \
+          --cleanup
+      fi
+    - echo "✅ Build completed successfully!"
+
+verify:endpoints:
+  stage: verify
+  image: mcr.microsoft.com/dotnet/sdk:8.0-alpine
+  before_script:
+    - apk add --no-cache curl bash grep
+  script:
+    - |
+      echo "Testing endpoints by running API directly with dotnet run"
+      
+      # Build and run the API in background
+      dotnet build -c Release
+      dotnet run --project Api/Api.csproj -c Release --no-build &
+      APP_PID=$!
+      
+      echo "Waiting for API to start..."
+      for i in $(seq 1 30); do 
+        if curl -fsS http://localhost:5080/health >/dev/null 2>&1; then 
+          echo "API is ready"; break; 
+        fi; 
+        sleep 1; 
+      done
+      
+      # Test endpoints
+      curl -fsS http://localhost:5080/health | grep -q '"status"'
+      curl -fsS -X POST http://localhost:5080/time-entries \
+        -H "Content-Type: application/json" \
+        -d '{"date":"2025-10-07","durationMinutes":90,"project":"QimTime"}' | grep -q '"id"'
+      curl -fsS "http://localhost:5080/time-entries?from=2025-10-01&to=2025-10-31" | grep -q 'QimTime'
+      echo "All endpoint tests passed"
+  after_script:
+    - kill $APP_PID || true
+
