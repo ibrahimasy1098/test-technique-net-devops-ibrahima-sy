@@ -22,8 +22,8 @@ app.MapPost("/time-entries", (TimeEntryRequest request) =>
     {
         errors.Add("date must be a valid ISO 8601 date (e.g., 2025-10-07)");
     }
-    // Validate durationMinutes ( > 0)
-    if (request.DurationMinutes <= 0)
+    // Validate durationMinutes (must be positive)
+    if (request.DurationMinutes < 0)
     {
         errors.Add("durationMinutes must be greater than 0");
     }
@@ -50,6 +50,29 @@ app.MapPost("/time-entries", (TimeEntryRequest request) =>
 
     return Results.Created($"/time-entries/{entry.Id}", entry);
 });
+
+// GET /time-entries - List entries with optional date filtering
+app.MapGet("/time-entries", (string? from, string? to) =>
+{
+    var result = timeEntries.AsEnumerable();
+
+    // Filter by 'from' date if provided
+    if (!string.IsNullOrWhiteSpace(from) && DateOnly.TryParse(from, out var fromDate))
+    {
+        result = result.Where(e => DateOnly.Parse(e.Date) >= fromDate);
+    }
+
+    // Filter by 'to' date if provided
+    if (!string.IsNullOrWhiteSpace(to) && DateOnly.TryParse(to, out var toDate))
+    {
+        result = result.Where(e => DateOnly.Parse(e.Date) <= toDate);
+    }
+
+    return Results.Ok(result.ToList());
+});
+
+// GET /health - Health check endpoint
+app.MapGet("/health", () => Results.Ok(new { status = "ok" }));
 
 app.Run();
 
