@@ -23,7 +23,7 @@ app.MapPost("/time-entries", (TimeEntryRequest request) =>
         errors.Add("date must be a valid ISO 8601 date (e.g., 2025-10-07)");
     }
     // Validate durationMinutes (must be positive)
-    if (request.DurationMinutes < 0)
+    if (request.DurationMinutes <= 0)
     {
         errors.Add("durationMinutes must be greater than 0");
     }
@@ -81,4 +81,7 @@ public record TimeEntryRequest(string? Date, int DurationMinutes, string? Projec
 
 // Time entry model stored
 public record TimeEntry(int Id, string Date, int DurationMinutes, string Project);
+
+// Expose Program class for integration testing
+public partial class Program { }
 
