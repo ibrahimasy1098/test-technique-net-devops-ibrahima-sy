@@ -51,27 +51,35 @@ curl "http://localhost:5080/time-entries?from=2025-10-01&to=2025-10-31"
 
 ---
 
-## 🐳 Docker (Non implémenté)
+## Docker
 
 ```bash
-# docker build -t time-entries-api .
-# docker run -p 5080:8080 time-entries-api
+# Build l'image
+docker build -t time-entries-api .
+
+# Lancer le conteneur
+docker run -p 5080:8080 time-entries-api
 ```
 
-*Note: Dockerfile non complété par manque de temps.*
+L'API sera accessible sur: `http://localhost:5080`
 
 ---
 
-## ⏱️ Temps passé
+## Temps passé
 
-Environ 32 minutes.
+Environ 35 minutes.
 
 ---
 
-## 📝 Notes
+## Notes
 
 - API Minimal .NET 8 avec validation des entrées
 - Stockage en mémoire (liste statique)
 - 2 tests d'intégration avec WebApplicationFactory
-- 3 commits conventionnels
+- Dockerfile multi-stage (build + runtime)
+- 4 commits conventionnels
+
+---
+
+PS: Le Dockerfile a été ajouté après la limite de temps initiale de 30 minutes.
 
